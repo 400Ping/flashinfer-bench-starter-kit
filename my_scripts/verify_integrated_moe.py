@@ -138,18 +138,43 @@ def make_generator(seed: int, seq_len: int, salt: int, device: str) -> torch.Gen
     return gen
 
 
-def make_static_inputs(device: str, seed: int) -> dict[str, torch.Tensor]:
-    gemm1_weights = (
-        torch.randn(
-            E_LOCAL,
-            2 * I,
-            H,
+def randn_to_float8_chunked(
+    shape: tuple[int, ...],
+    *,
+    device: str,
+    generator: torch.Generator,
+    scale: float,
+    chunk_dim: int = 0,
+    chunk_size: int = 1,
+) -> torch.Tensor:
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive.")
+
+    out = torch.empty(shape, device=device, dtype=torch.float8_e4m3fn)
+    for start in range(0, shape[chunk_dim], chunk_size):
+        stop = min(start + chunk_size, shape[chunk_dim])
+        chunk_shape = list(shape)
+        chunk_shape[chunk_dim] = stop - start
+        chunk = torch.randn(
+            tuple(chunk_shape),
             device=device,
             dtype=torch.float32,
-            generator=make_generator(seed, 0, 11, device),
+            generator=generator,
         )
-        * 0.05
-    ).to(torch.float8_e4m3fn)
+        if scale != 1.0:
+            chunk.mul_(scale)
+        out[start:stop].copy_(chunk.to(torch.float8_e4m3fn))
+        del chunk
+    return out
+
+
+def make_static_inputs(device: str, seed: int) -> dict[str, torch.Tensor]:
+    gemm1_weights = randn_to_float8_chunked(
+        (E_LOCAL, 2 * I, H),
+        device=device,
+        generator=make_generator(seed, 0, 11, device),
+        scale=0.05,
+    )
     gemm1_weights_scale = torch.rand(
         E_LOCAL,
         (2 * I) // 128,
@@ -158,17 +183,12 @@ def make_static_inputs(device: str, seed: int) -> dict[str, torch.Tensor]:
         dtype=torch.float32,
         generator=make_generator(seed, 0, 13, device),
     )
-    gemm2_weights = (
-        torch.randn(
-            E_LOCAL,
-            H,
-            I,
-            device=device,
-            dtype=torch.float32,
-            generator=make_generator(seed, 0, 17, device),
-        )
-        * 0.05
-    ).to(torch.float8_e4m3fn)
+    gemm2_weights = randn_to_float8_chunked(
+        (E_LOCAL, H, I),
+        device=device,
+        generator=make_generator(seed, 0, 17, device),
+        scale=0.05,
+    )
     gemm2_weights_scale = torch.rand(
         E_LOCAL,
         H // 128,
@@ -207,16 +227,13 @@ def make_dynamic_inputs(seq_len: int, device: str, seed: int) -> dict[str, torch
         )
         * 0.1
     )
-    hidden_states = (
-        torch.randn(
-            seq_len,
-            H,
-            device=device,
-            dtype=torch.float32,
-            generator=make_generator(seed, seq_len, 31, device),
-        )
-        * 0.1
-    ).to(torch.float8_e4m3fn)
+    hidden_states = randn_to_float8_chunked(
+        (seq_len, H),
+        device=device,
+        generator=make_generator(seed, seq_len, 31, device),
+        scale=0.1,
+        chunk_size=1024,
+    )
     hidden_states_scale = torch.rand(
         H // 128,
         seq_len,
@@ -249,8 +266,8 @@ def parse_seq_lengths(args: argparse.Namespace) -> list[int]:
 
 
 def summarize_diff(gold: torch.Tensor, test: torch.Tensor) -> tuple[float, float, float]:
-    gold_f32 = gold.to(torch.float32)
-    test_f32 = test.to(torch.float32)
+    gold_f32 = gold.to(device="cpu", dtype=torch.float32, copy=False)
+    test_f32 = test.to(device="cpu", dtype=torch.float32, copy=False)
     diff = gold_f32 - test_f32
     mse = torch.mean(diff * diff).item()
     max_abs = torch.max(torch.abs(diff)).item()
@@ -386,9 +403,18 @@ def verify_one(
     )
 
     gold_out, gold_ms = measure_cuda_ms(gold_kernel.run, *common_args)
-    test_out, test_ms = measure_cuda_ms(integrated_moe_fn, *common_args)
+    gold_out_cpu = gold_out.to(device="cpu", dtype=torch.float32)
+    del gold_out
+    torch.cuda.empty_cache()
 
-    mse, max_abs, max_rel = summarize_diff(gold_out, test_out)
+    test_out, test_ms = measure_cuda_ms(integrated_moe_fn, *common_args)
+    test_out_cpu = test_out.to(device="cpu", dtype=torch.float32)
+    del test_out
+    torch.cuda.empty_cache()
+
+    mse, max_abs, max_rel = summarize_diff(gold_out_cpu, test_out_cpu)
+    del gold_out_cpu, test_out_cpu
+    torch.cuda.empty_cache()
     passed = mse <= 1e-4 and max_abs <= 5e-2
     speedup = (gold_ms / test_ms) if test_ms > 0 else float("inf")
     stats = {
@@ -404,8 +430,6 @@ def verify_one(
         "k4_backend": dispatch_stats["k4_backend"],
         "k6_backend": dispatch_stats["k6_backend"],
     }
-
-    del gold_out, test_out
     for tensor in dynamic_inputs.values():
         del tensor
     torch.cuda.empty_cache()
@@ -429,6 +453,11 @@ def format_result(passed: bool, stats: dict[str, float]) -> str:
     )
 
 
+def format_oom_skip(seq_len: int, err: torch.OutOfMemoryError) -> str:
+    first_line = str(err).splitlines()[0] if str(err) else "CUDA out of memory."
+    return f"[SKIP] seq_len={seq_len:5d} reason={first_line}"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Verify my_scripts/integrated_moe_kernel.py against the gold kernel in gpt5."
@@ -447,6 +476,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-expert-offset", type=int, default=96, help="Local expert offset for both kernels.")
     parser.add_argument("--routed-scaling-factor", type=float, default=1.0, help="Routing scaling factor.")
     parser.add_argument("--stop-on-fail", action="store_true", help="Stop after the first failing sequence length.")
+    parser.add_argument(
+        "--fail-on-oom",
+        action="store_true",
+        help="Abort immediately if any testcase runs out of CUDA memory instead of skipping it.",
+    )
     return parser
 
 
@@ -466,17 +500,26 @@ def main() -> int:
 
     all_stats: list[dict[str, float]] = []
     failures: list[dict[str, float]] = []
+    skipped_oom: list[int] = []
     for seq_len in seq_lengths:
-        passed, stats = verify_one(
-            gold_kernel=gold_kernel,
-            integrated_moe_fn=integrated_moe_fn,
-            seq_len=seq_len,
-            static_inputs=static_inputs,
-            device=args.device,
-            seed=args.seed,
-            local_expert_offset=args.local_expert_offset,
-            routed_scaling_factor=args.routed_scaling_factor,
-        )
+        try:
+            passed, stats = verify_one(
+                gold_kernel=gold_kernel,
+                integrated_moe_fn=integrated_moe_fn,
+                seq_len=seq_len,
+                static_inputs=static_inputs,
+                device=args.device,
+                seed=args.seed,
+                local_expert_offset=args.local_expert_offset,
+                routed_scaling_factor=args.routed_scaling_factor,
+            )
+        except torch.OutOfMemoryError as err:
+            torch.cuda.empty_cache()
+            if args.fail_on_oom:
+                raise
+            skipped_oom.append(seq_len)
+            print(format_oom_skip(seq_len, err), flush=True)
+            continue
         all_stats.append(stats)
         print(format_result(passed, stats), flush=True)
         if not passed:
@@ -487,6 +530,7 @@ def main() -> int:
     total_gpt5_ms = sum(item["gpt5_ms"] for item in all_stats)
     total_librouter_ffi_ms = sum(item["librouter_ffi_ms"] for item in all_stats)
     overall_speedup = (total_gpt5_ms / total_librouter_ffi_ms) if total_librouter_ffi_ms > 0 else float("inf")
+    skipped_summary = f" skipped_oom={skipped_oom}" if skipped_oom else ""
 
     if failures:
         worst = max(failures, key=lambda item: (item["mse"], item["max_abs"], item["max_rel"]))
@@ -499,6 +543,7 @@ def main() -> int:
             f"total_gpt5={total_gpt5_ms:.3f}ms "
             f"total_librouter_ffi={total_librouter_ffi_ms:.3f}ms "
             f"overall_speedup={overall_speedup:.3f}x"
+            f"{skipped_summary}"
         )
         return 1
 
@@ -507,6 +552,7 @@ def main() -> int:
         f"total_gpt5={total_gpt5_ms:.3f}ms "
         f"total_librouter_ffi={total_librouter_ffi_ms:.3f}ms "
         f"overall_speedup={overall_speedup:.3f}x"
+        f"{skipped_summary}"
     )
     return 0
 
